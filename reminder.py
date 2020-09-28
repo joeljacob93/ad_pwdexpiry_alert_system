@@ -1,0 +1,219 @@
+param(
+    # $smtpServer Enter Your SMTP Server Hostname or IP Address
+    [Parameter(Mandatory=$True,Position=0)]
+    [ValidateNotNull()]
+    [string]$smtpServer,
+    # Notify Users if Expiry Less than X Days
+    [Parameter(Mandatory=$True,Position=1)]
+    [ValidateNotNull()]
+    [int]$expireInDays,
+    # From Address, eg "IT Support <support@domain.com>"
+    [Parameter(Mandatory=$True,Position=2)]
+    [ValidateNotNull()]
+    [string]$from,
+    [Parameter(Position=3)]
+    [switch]$logging,
+    # Log File Path
+    [Parameter(Position=4)]
+    [string]$logPath,
+    # Testing Enabled
+    [Parameter(Position=5)]
+    [switch]$testing,
+    # Test Recipient, eg recipient@domain.com
+    [Parameter(Position=6)]
+    [string]$testRecipient,
+    [Parameter(Position=7)]
+    [switch]$status
+)
+###################################################################################################################
+$start = [datetime]::Now
+$midnight = $start.Date.AddDays(1)
+$timeToMidnight = New-TimeSpan -Start $start -end $midnight.Date
+$midnight2 = $start.Date.AddDays(2)
+$timeToMidnight2 = New-TimeSpan -Start $start -end $midnight2.Date
+# System Settings
+$textEncoding = [System.Text.Encoding]::UTF8
+$today = $start
+# End System Settings
+
+# Get Users From AD who are Enabled, Passwords Expire and are Not Currently Expired
+Import-Module ActiveDirectory
+$padVal = "20"
+Write-Output "Script Loaded"
+Write-Output "*** Settings Summary ***"
+$smtpServerLabel = "SMTP Server".PadRight($padVal," ")
+$expireInDaysLabel = "Expire in Days".PadRight($padVal," ")
+$fromLabel = "From".PadRight($padVal," ")
+$testLabel = "Testing".PadRight($padVal," ")
+$testRecipientLabel = "Test Recipient".PadRight($padVal," ")
+$logLabel = "Logging".PadRight($padVal," ")
+$logPathLabel = "Log Path".PadRight($padVal," ")
+if($testing)
+{
+    if(($testRecipient) -eq $null)
+    {
+        Write-Output "No Test Recipient Specified"
+        Exit
+    }
+}
+if($logging)
+{
+    if(($logPath) -eq $null)
+    {
+        $logPath = $PSScriptRoot
+    }
+}
+Write-Output "$smtpServerLabel : $smtpServer"
+Write-Output "$expireInDaysLabel : $expireInDays"
+Write-Output "$fromLabel : $from"
+Write-Output "$logLabel : $logging"
+Write-Output "$logPathLabel : $logPath"
+Write-Output "$testLabel : $testing"
+Write-Output "$testRecipientLabel : $testRecipient"
+Write-Output "*".PadRight(25,"*")
+$users = get-aduser -filter {(Enabled -eq $true) -and (PasswordNeverExpires -eq $false)} -properties Name, PasswordNeverExpires, PasswordExpired, PasswordLastSet, EmailAddress | where { $_.Enabled -eq $true }
+# Count Users
+$usersCount = ($users | Measure-Object).Count
+Write-Output "Found $usersCount User Objects"
+# Collect Domain Password Policy Information
+$defaultMaxPasswordAge = (Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop).MaxPasswordAge.Days 
+Write-Output "Domain Default Password Age: $defaultMaxPasswordAge"
+# Collect Users
+$colUsers = @()
+# Process Each User for Password Expiry
+Write-Output "Process User Objects"
+foreach ($user in $users)
+{
+    $Name = $user.Name
+    $emailaddress = $user.emailaddress
+    $passwordSetDate = $user.PasswordLastSet
+    $samAccountName = $user.SamAccountName
+    $pwdLastSet = $user.PasswordLastSet
+    # Check for Fine Grained Password
+    $maxPasswordAge = $defaultMaxPasswordAge
+    $PasswordPol = (Get-AduserResultantPasswordPolicy $user) 
+    if (($PasswordPol) -ne $null)
+    {
+        $maxPasswordAge = ($PasswordPol).MaxPasswordAge.Days
+    }
+    # Create User Object
+    $userObj = New-Object System.Object
+    $expireson = $pwdLastSet.AddDays($maxPasswordAge)
+    $daysToExpire = New-TimeSpan -Start $today -End $Expireson
+    
+
+    
+
+
+    # Round Up or Down
+     if(($daysToExpire.Days -lt "0"))
+    {
+        $userObj | Add-Member -Type NoteProperty -Name UserMessage -Value "has expired."
+    }
+    if(($daysToExpire.Days -eq "0") -and ($daysToExpire.TotalHours -le $timeToMidnight.TotalHours))
+    {
+        $userObj | Add-Member -Type NoteProperty -Name UserMessage -Value "will expire today."
+    }
+    if(($daysToExpire.Days -eq "0") -and ($daysToExpire.TotalHours -gt $timeToMidnight.TotalHours) -or ($daysToExpire.Days -eq "1") -and ($daysToExpire.TotalHours -le $timeToMidnight2.TotalHours))
+    {
+        $userObj | Add-Member -Type NoteProperty -Name UserMessage -Value "will expire tomorrow."
+    }
+    if(($daysToExpire.Days -ge "1") -and ($daysToExpire.TotalHours -gt $timeToMidnight2.TotalHours))
+    {
+        $days = $daysToExpire.TotalDays
+        $days = [math]::Round($days)
+        $userObj | Add-Member -Type NoteProperty -Name UserMessage -Value "will expire in $days days."
+    }
+    $daysToExpire = [math]::Round($daysToExpire.TotalDays)
+    $userObj | Add-Member -Type NoteProperty -Name UserName -Value $samAccountName
+    $userObj | Add-Member -Type NoteProperty -Name Name -Value $Name
+    $userObj | Add-Member -Type NoteProperty -Name EmailAddress -Value $emailAddress
+    $userObj | Add-Member -Type NoteProperty -Name PasswordSet -Value $pwdLastSet
+    $userObj | Add-Member -Type NoteProperty -Name DaysToExpire -Value $daysToExpire
+    $userObj | Add-Member -Type NoteProperty -Name ExpiresOn -Value $expiresOn
+    $colUsers += $userObj
+}
+$colUsersCount = ($colUsers | Measure-Object).Count
+Write-Output "$colusersCount Users processed"
+$notifyUsers = $colUsers | where { $_.DaysToExpire -le $expireInDays}
+$notifiedUsers = @()
+$notifyCount = ($notifyUsers | Measure-Object).Count
+Write-Output "$notifyCount Users to notify"
+foreach ($user in $notifyUsers)
+{
+    # Email Address
+    $samAccountName = $user.UserName
+    $emailAddress = $user.EmailAddress
+    # Set Greeting Message
+    $name = $user.Name
+    $messageDays = $user.UserMessage
+    # Subject Setting
+    $subject="Your password $messageDays"
+    # Email Body Set Here.
+    $body ="
+  <font face=""verdana""> 
+    Dear $name, 
+    <p> Your Password $messageDays<br> 
+    To change your password, Please logon to <a href=""https://selfservice.cintra.com"">Self Service Portal</a> <br>
+    For queries please contact <a href=""mailto:it@cintra.com""?subject=Password Expiry Assistance"">it@cintra.com</a>
+    <p>Thanks, <br>  
+    </P> 
+    IT Team 
+    </font>" 
+       
+    # If Testing Is Enabled - Email Administrator
+    if($testing)
+    {
+        $emailaddress = $testRecipient
+    } # End Testing
+
+    # If a user has no email address listed
+    if(($emailaddress) -eq $null)
+    {
+        $emailaddress = $testRecipient    
+    }# End No Valid Email
+    $samLabel = $samAccountName.PadRight($padVal," ")
+    if($status)
+    {
+        Write-Output "Sending Email : $samLabel : $emailAddress"
+    }
+    try
+    {
+        Send-Mailmessage -smtpServer $smtpServer -from $from -to $emailAddress -subject $subject -body $body -bodyasHTML -priority High -Encoding $textEncoding -ErrorAction Stop
+        $user | Add-Member -MemberType NoteProperty -Name SendMail -Value "OK"
+    }
+    catch
+    {
+        $errorMessage = $_.exception.Message
+        if($status)
+        {
+           $errorMessage
+        }
+        $user | Add-Member -MemberType NoteProperty -Name SendMail -Value $errorMessage    
+    }
+    $notifiedUsers += $user
+}
+if($logging)
+{
+    # Create Log File
+    Write-Output "Creating Log File"
+    $day = $today.Day
+    $month = $today.Month
+    $year = $today.Year
+    $date = "$day-$month-$year"
+    $logFileName = "$date-PasswordLog.csv"
+    if(!($logPath.EndsWith("\")))
+    {
+       $logFile = $logPath + "\"
+    }
+    $logFile = $logFile + $logFileName
+    Write-Output "Log Output: $logfile"
+    $notifiedUsers | Export-CSV $logFile
+}
+$notifiedUsers | select UserName,Name,EmailAddress,PasswordSet,DaysToExpire,ExpiresOn | sort DaystoExpire | FT -autoSize
+
+
+$stop = [datetime]::Now
+$runTime = New-TimeSpan $start $stop
+Write-Output "Script Runtime: $runtime"
+# End
